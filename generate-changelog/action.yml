@@ -1,0 +1,179 @@
+name: 'Conventional Changelog Generator'
+description: 'Generates a changelog.md file based on conventional commits'
+author: 'bercianor'
+
+inputs:
+  current_tag:
+    description: 'Current tag (end of the range). Defaults to the current r tag.'
+    required: false
+    default: ${{ github.ref_name }}
+  previous_tag:
+    description: 'Starting tag for the range. If not provided, it will be automatically detected.'
+    required: false
+    default: ''
+  include_pre_releases:
+    description: 'When auto-detecting, should it include pre-releases (beta, rc, alpha, etc.)? "true" or "false".'
+    required: false
+    default: 'false'
+  exclude_types:
+    description: 'Comma-separated types to hide (e.g., "chore,build,ci,test")'
+    required: false
+    default: ''
+  repository:
+    description: 'Repository in "owner/repo" format.'
+    required: false
+    default: ${{ github.repository }}
+
+outputs:
+  changelog_content:
+    description: 'Generated markdown content'
+    value: ${{ steps.script.outputs.content }}
+  changelog_path:
+    description: 'Path to changelog.md'
+    value: 'changelog.md'
+
+runs:
+  using: "composite"
+  steps:
+
+    - name: Ensure Git history
+      shell: bash
+      run: |
+        # Check if git repository exists
+        if [ ! -d .git ]; then echo "::error::No git repo found."; exit 1; fi
+        # Check if repository is shallow and fetch history/tags
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then git fetch --unshallow --tags; else git fetch --tags; fi
+
+    - id: script
+      shell: bash
+      run: |
+        CURRENT_TAG="${{ inputs.current_tag }}"
+        PREV_TAG_INPUT="${{ inputs.previous_tag }}"
+        INCLUDE_PRE="${{ inputs.include_pre_releases }}"
+        EXCLUDE_TYPES="${{ inputs.exclude_types }}"
+        REPO="${{ inputs.repository }}"
+
+        # 1. Determine the previous tag
+        if [ -n "$PREV_TAG_INPUT" ]; then
+          PREV_TAG="$PREV_TAG_INPUT"
+          echo "Using manually provided previous tag: $PREV_TAG"
+        else
+          echo "Auto-detecting previous tag (Include pre-releases: $INCLUDE_PRE)..."
+          FILTER="(beta|rc|alpha|pre)"
+          [ "$INCLUDE_PRE" = "true" ] && FILTER="a-z0-9" # dummy filter that matches nothing
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v -i -E "$FILTER" | grep -v "^${CURRENT_TAG}$" | head -n 1)
+        fi
+
+        echo "Generating changelog for range: ${PREV_TAG:-initial} -> ${CURRENT_TAG}"
+
+        # 2. Define Git log range
+        RANGE="${PREV_TAG:-HEAD}..HEAD"
+        [ -z "$PREV_TAG" ] && RANGE="HEAD"
+
+        # 3. Collect and classify commits
+        # Format: HASH <TAB> SUBJECT <TAB> AUTHOR
+        # %H = full hash, %s = subject, %aN = author name
+        mapfile -t COMMITS < <(git log "$RANGE" --no-merges --pretty=format:"%H	%s	%aN")
+
+        # Classify by conventional commit type
+        FEAT=(); FIX=(); PERF=(); REFACTOR=(); DOCS=(); TEST=(); BUILD=(); CHORE=(); OTHER=()
+        declare -A CONTRIBUTORS
+        HAS_BREAKING=false
+
+        for entry in "${COMMITS[@]}"; do
+          HASH=$(echo "$entry" | cut -f1)
+          SUBJECT=$(echo "$entry" | cut -f2)
+          AUTHOR=$(echo "$entry" | cut -f3)
+          SHORT="${HASH:0:7}"
+          CONTRIBUTORS["$AUTHOR"]=1
+
+          # Create Markdown link for the commit
+          COMMIT_LINK="[\`${SHORT}\`](${{ github.server_url }}/${REPO}/commit/${HASH})"
+
+          PREFIX=""
+          # Detect breaking change ( !: or BREAKING CHANGE in text )
+          if [[ "$SUBJECT" =~ ^[a-z]+(\([^)]*\))?!: ]] || [[ "$SUBJECT" == *"BREAKING CHANGE"* ]]; then
+            PREFIX="🚨 "
+            HAS_BREAKING=true
+          fi
+
+          # Conventional Commit Regex: type(scope)!: description
+          # Group 1: type, Group 2: scope, Group 3: breaking mark (!), Group 4: description
+          CONV_RE='^([a-z]+)(\(([^)]+)\))?(!?):[[:space:]](.+)$'
+
+          if [[ "$SUBJECT" =~ $CONV_RE ]]; then
+            TYPE="${BASH_REMATCH[1]}"
+            SCOPE="${BASH_REMATCH[3]}"
+            DESC="${BASH_REMATCH[5]}"
+
+            FINAL_DESC="$DESC"
+            [ -n "$SCOPE" ] && FINAL_DESC="**${SCOPE}**: ${DESC}"
+
+            LINE="- ${PREFIX}${FINAL_DESC} (${COMMIT_LINK})"
+
+            # Skip if type is in exclude_types
+            [[ ",$EXCLUDE_TYPES," == *",$TYPE,"* ]] && continue
+
+            case "$TYPE" in
+              feat)     FEAT+=("$LINE") ;;
+              fix)      FIX+=("$LINE") ;;
+              perf)     PERF+=("$LINE") ;;
+              refactor) REFACTOR+=("$LINE") ;;
+              docs)     DOCS+=("$LINE") ;;
+              test)     TEST+=("$LINE") ;;
+              build|ci) BUILD+=("$LINE") ;;
+              chore)    CHORE+=("$LINE") ;;
+              *)        OTHER+=("- ${PREFIX}${SUBJECT} (${COMMIT_LINK})") ;;
+            esac
+          else
+            OTHER+=("- ${PREFIX}${SUBJECT} (${COMMIT_LINK})")
+          fi
+        done
+
+        # Helper function to render sections
+        write_section() {
+          local TITLE="$1"; shift; local ITEMS=("${@}")
+          if [ ${#ITEMS[@]} -gt 0 ]; then
+            echo "### ${TITLE}"; for item in "${ITEMS[@]}"; do echo "$item"; done; echo ""
+          fi
+        }
+
+        # 4. Build Markdown content
+        {
+          echo "## What's Changed"
+          echo ""
+          write_section "✨ New Features"    "${FEAT[@]}"
+          write_section "🐛 Bug Fixes"       "${FIX[@]}"
+          write_section "⚡ Performance"     "${PERF[@]}"
+          write_section "♻️ Refactoring"     "${REFACTOR[@]}"
+          write_section "📚 Documentation"   "${DOCS[@]}"
+          write_section "🧪 Tests"           "${TEST[@]}"
+          write_section "🔧 Build & CI"      "${BUILD[@]}"
+          write_section "🏠 Chores"          "${CHORE[@]}"
+          write_section "📦 Other Changes"   "${OTHER[@]}"
+
+          if [ ${#CONTRIBUTORS[@]} -gt 0 ]; then
+            echo "### 👥 Contributors"
+            # Sort authors alphabetically
+            printf "%s\n" "${!CONTRIBUTORS[@]}" | sort | while read -r name; do echo "- ${name}"; done
+            echo ""
+          fi
+
+          # 5. Breaking Changes Notice
+          if [ "$HAS_BREAKING" = "true" ]; then
+            echo "> [!IMPORTANT]"
+            echo "> Changes marked with 🚨 include **breaking changes**."
+            echo ""
+          fi
+
+          # 6. Full diff link
+          if [ -n "$PREV_TAG" ]; then
+            echo "---"
+            echo "**Full changelog:** [\`${PREV_TAG}\` -> \`${CURRENT_TAG}\`](${{ github.server_url }}/${REPO}/compare/${PREV_TAG}...${CURRENT_TAG})"
+          fi
+
+        } > changelog.md
+
+        echo "content<<EOF" >> $GITHUB_OUTPUT
+        cat changelog.md >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
